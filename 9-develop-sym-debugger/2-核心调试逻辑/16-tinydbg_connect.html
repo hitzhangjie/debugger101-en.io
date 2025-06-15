@@ -1918,7 +1918,71 @@
     
                                 <section class="normal markdown-section">
                                 
-                                <p>coming soon ...</p>
+                                <h2 id="connect">Connect</h2>
+<h3 id="implementation-goal-tinydbg-connect-addr">Implementation Goal: <code>tinydbg connect &lt;addr&gt;</code></h3>
+<p>In remote debugging mode, the connect command is used to connect to a debugger backend, initialize the network communication layer, and then initialize a frontend debugging session, allowing developers to debug interactively.</p>
+<pre><code class="lang-bash">$ tinydbg <span class="hljs-built_in">help</span> connect
+Connect to a running headless debug server with a terminal client. Prefix with <span class="hljs-string">&apos;unix:&apos;</span> to use a unix domain socket.
+
+Usage:
+  tinydbg connect &lt;addr&gt; [flags]
+
+Flags:
+  -h, --help   <span class="hljs-built_in">help</span> <span class="hljs-keyword">for</span> connect
+
+Global Flags:
+      --init string         Init file, executed by the terminal client.
+      --log                 Enable debugging server logging.
+      --log-dest string     Writes logs to the specified file or file descriptor (see <span class="hljs-string">&apos;dlv help log&apos;</span>).
+      --log-output string   Comma separated list of components that should produce debug output (see <span class="hljs-string">&apos;dlv help log&apos;</span>)
+</code></pre>
+<h3 id="basic-knowledge">Basic Knowledge</h3>
+<p>Compared to attach, exec, debug (or test), and core debugging commands, connect is specifically designed for remote debugging. Since it&apos;s remote debugging, it involves the debugger frontend and backend running independently.</p>
+<p>The debugger backend can be started using attach, exec, debug (or test), or core commands, combined with the <code>--headless</code> parameter to launch a debugger backend that waits for the debugger frontend to communicate via TCPConn or UnixConn using JSON RPC or DAP RPC protocols. In our demo tinydbg, we only support JSON-RPC communication. Regarding DAP (Debug Adapter Protocol), we&apos;ll introduce it in the &quot;3-Advanced Feature Extensions&quot; section.</p>
+<p>When running the debugger backend, you can specify a listening address using the <code>-l | --listen</code> parameter:</p>
+<pre><code class="lang-bash"><span class="hljs-_">-l</span>, --listen string                    Debugging server listen address. Prefix with <span class="hljs-string">&apos;unix:&apos;</span> to use a unix domain socket. (default <span class="hljs-string">&quot;127.0.0.1:0&quot;</span>)
+</code></pre>
+<ul>
+<li>default: 127.0.0.1:0, when the port is not specified, a port will be automatically assigned, and the debugger process will print out the listening address for the debugger frontend to connect;
+After integration with VSCode, to make debugging more convenient, the frontend and backend need to agree on the listening address to facilitate VSCode debugger frontend connection;</li>
+<li>Specify a specific IP:PORT if you have planned to use a particular IP:PORT for RPC communication;</li>
+<li>Specify unix:/path-to/socket to use Unix Domain Socket for communication;</li>
+</ul>
+<p>If we consider VSCode remote development, container development, and WebIDE remote development, we need to discuss VSCode&apos;s C/S separation architecture and plugin running methods (extensionKind, in UI/Local Extension Host, Remote/Workspace Extension Host, or both). If we have time, we&apos;ll share how VSCode (C/S), VSCode debugger plugins (local/remote extension host), and debugger frontend/backend (C/S) interact with each other.</p>
+<p>OK, let&apos;s get back to the main topic and introduce the code implementation of the connect command.</p>
+<h3 id="code-implementation">Code Implementation</h3>
+<p>In the previous debugger session section, we mentioned the general implementation approach of connect. Let&apos;s briefly review it again. The code path for establishing a debugging session is:</p>
+<pre><code class="lang-bash">main.go:main.main
+    \--&gt; cmds.New(<span class="hljs-literal">false</span>).Execute()
+            \--&gt; connectCommand.Run()
+                    \--&gt; connectCmd(...)
+                            \--&gt; connect(addr, nil, conf)
+                                    \--&gt; conn := netDial(addr)
+                                            \--&gt; <span class="hljs-keyword">if</span> isTCPAddress, conn, _ := net.Dial(<span class="hljs-string">&quot;tcp&quot;</span>, addr) 
+                                            \--&gt; <span class="hljs-keyword">if</span> isUnixAddress, conn, _ := net.Dial(<span class="hljs-string">&quot;unix&quot;</span>, addr)
+                                    \--&gt; client := rpc2.NewClientFromConn(conn)
+                                    \--&gt; session := debug.New(client, conf)
+                                    \--&gt; session.Run()
+                                            \--&gt; forloop
+                                                    \--&gt; <span class="hljs-built_in">read</span> input
+                                                    \--&gt; parse debugcmd flags args
+                                                    \--&gt; session.client.Call(<span class="hljs-string">&apos;RPCServer.&apos;</span>+method, req, rsp)
+                                                            \--&gt; json-rpc over tcpconn or unixconn
+                                                    \--&gt; update UI based on rsp
+</code></pre>
+<p>When executing the connect command, it roughly follows the above code path. Connect determines whether the parameter addr is a TCP listening address or a Unix domain socket, then establishes the corresponding connection. Once the connection is established, the RPC client can be initialized. Then a debugging session is initialized, and when the debugging session runs, it becomes a REPL-like loop that reads input, parses commands, parameters, and options, then executes them. However, here the execution requires interaction with the debugger server, and almost all debugging commands work this way. The debugging session and debugger server communicate through the established communication link to complete request sending and response receiving. Then, based on the response, the debugger frontend updates the display, such as showing variable values, instruction lists, printing type details, displaying the current program execution instruction address and source code location, etc.</p>
+<p>We have already detailed the debugging session initialization, network communication layer initialization process, and the detailed interaction process between the debugger frontend and backend in the debugging session section, so we won&apos;t repeat it here.</p>
+<p>It&apos;s worth mentioning that the debugger backend only accepts multiple incoming client connection requests during execution if <code>--accept-multiclient</code> is specified when starting the debugger:</p>
+<ul>
+<li>Client 1 is debugging, and Client 2 wants to connect;</li>
+<li>Client 2 has finished debugging and has disconnected from the debug server, but hasn&apos;t killed the process instance, and a client wants to connect;</li>
+</ul>
+<p>In both cases, if you want to allow Client 2 to connect, you need to explicitly specify the <code>--accept-multiclient</code> option when starting the debugger backend. So why isn&apos;t the <code>--accept-multiclient</code> option enabled by default?</p>
+<p>For common <code>tinydbg debug ...</code> operations, since the program is automatically built and started by us, the default expectation after debugging is that this process has been used up and doesn&apos;t need to continue existing, so it will prompt the debugger whether to automatically kill the process, and in most cases, people will click &quot;Yes&quot;. This is the most common scenario. For cases where debugging is completed once and then initiated again, but in this case, it means the problem can&apos;t be determined immediately and requires multiple debugging sessions to track, in this case with a clear requirement, you can directly add the <code>--accept-multiclient</code> option when starting. Additionally, if we add this option, during our debugging session, if someone really connects, their debugging actions might affect us. However, allowing multiple clients to log in simultaneously also adds some flexibility, such as allowing multiple people to debug and locate exceptions together.</p>
+<h3 id="execution-testing">Execution Testing</h3>
+<p>Omitted</p>
+<h3 id="section-summary">Section Summary</h3>
+<p>This section introduced the implementation of the connect command, which allows the debugger frontend to connect to an independently running debugger backend process. We detailed the connection establishment process, debugging session initialization, and considerations regarding multi-client connection support. This provides a foundation for understanding how debuggers work in distributed debugging scenarios.</p>
 
                                 
                                 </section>
@@ -1962,7 +2026,7 @@
     <script>
         var gitbook = gitbook || [];
         gitbook.push(function() {
-            gitbook.page.hasChanged({"page":{"title":"9.2.16 tinydbg connect","level":"1.9.2.9","depth":3,"next":{"title":"9.2.17 tinydbg trace","level":"1.9.2.10","depth":3,"path":"9-develop-sym-debugger/2-核心调试逻辑/17-tinydbg_trace.md","ref":"9-develop-sym-debugger/2-核心调试逻辑/17-tinydbg_trace.md","articles":[]},"previous":{"title":"9.2.15 tinydbg core - part2","level":"1.9.2.8","depth":3,"path":"9-develop-sym-debugger/2-核心调试逻辑/15-tinydbg_core2.md","ref":"9-develop-sym-debugger/2-核心调试逻辑/15-tinydbg_core2.md","articles":[]},"dir":"ltr"},"config":{"gitbook":"*","theme":"default","variables":{},"plugins":["md-toc"],"pluginsConfig":{"intopic-toc":{"selector":".markdown-section h1, .markdown-section h2, .markdown-section h3, .markdown-section h4, .markdown-section h5, .markdown-section h6","visible":true,"label":{"en":"In This Article","zh":"本文目录"}},"md-toc":{"label":"In this article","selector":".markdown-section h2","visible":true},"highlight":{},"search":{},"lunr":{"maxIndexSize":1000000,"ignoreSpecialCharacters":false},"sharing":{"facebook":true,"twitter":true,"google":false,"weibo":false,"instapaper":false,"vk":false,"all":["facebook","google","twitter","weibo","instapaper"]},"fontsettings":{"theme":"white","family":"sans","size":2},"theme-default":{"styles":{"website":"styles/website.css","pdf":"styles/pdf.css","epub":"styles/epub.css","mobi":"styles/mobi.css","ebook":"styles/ebook.css","print":"styles/print.css"},"showLevel":false}},"structure":{"langs":"LANGS.md","readme":"README.md","glossary":"GLOSSARY.md","summary":"SUMMARY.md"},"pdf":{"pageNumbers":true,"fontSize":12,"fontFamily":"Arial","paperSize":"a4","chapterMark":"pagebreak","pageBreaksBefore":"/","margin":{"right":62,"left":62,"top":56,"bottom":56}},"styles":{"website":"styles/website.css","pdf":"styles/pdf.css","epub":"styles/epub.css","mobi":"styles/mobi.css","ebook":"styles/ebook.css","print":"styles/print.css"}},"file":{"path":"9-develop-sym-debugger/2-核心调试逻辑/16-tinydbg_connect.md","mtime":"2025-06-15T12:49:31.518Z","type":"markdown"},"gitbook":{"version":"3.2.3","time":"2025-06-15T13:13:32.255Z"},"basePath":"../..","book":{"language":""}});
+            gitbook.page.hasChanged({"page":{"title":"9.2.16 tinydbg connect","level":"1.9.2.9","depth":3,"next":{"title":"9.2.17 tinydbg trace","level":"1.9.2.10","depth":3,"path":"9-develop-sym-debugger/2-核心调试逻辑/17-tinydbg_trace.md","ref":"9-develop-sym-debugger/2-核心调试逻辑/17-tinydbg_trace.md","articles":[]},"previous":{"title":"9.2.15 tinydbg core - part2","level":"1.9.2.8","depth":3,"path":"9-develop-sym-debugger/2-核心调试逻辑/15-tinydbg_core2.md","ref":"9-develop-sym-debugger/2-核心调试逻辑/15-tinydbg_core2.md","articles":[]},"dir":"ltr"},"config":{"gitbook":"*","theme":"default","variables":{},"plugins":["md-toc"],"pluginsConfig":{"intopic-toc":{"selector":".markdown-section h1, .markdown-section h2, .markdown-section h3, .markdown-section h4, .markdown-section h5, .markdown-section h6","visible":true,"label":{"en":"In This Article","zh":"本文目录"}},"md-toc":{"label":"In this article","selector":".markdown-section h2","visible":true},"highlight":{},"search":{},"lunr":{"maxIndexSize":1000000,"ignoreSpecialCharacters":false},"sharing":{"facebook":true,"twitter":true,"google":false,"weibo":false,"instapaper":false,"vk":false,"all":["facebook","google","twitter","weibo","instapaper"]},"fontsettings":{"theme":"white","family":"sans","size":2},"theme-default":{"styles":{"website":"styles/website.css","pdf":"styles/pdf.css","epub":"styles/epub.css","mobi":"styles/mobi.css","ebook":"styles/ebook.css","print":"styles/print.css"},"showLevel":false}},"structure":{"langs":"LANGS.md","readme":"README.md","glossary":"GLOSSARY.md","summary":"SUMMARY.md"},"pdf":{"pageNumbers":true,"fontSize":12,"fontFamily":"Arial","paperSize":"a4","chapterMark":"pagebreak","pageBreaksBefore":"/","margin":{"right":62,"left":62,"top":56,"bottom":56}},"styles":{"website":"styles/website.css","pdf":"styles/pdf.css","epub":"styles/epub.css","mobi":"styles/mobi.css","ebook":"styles/ebook.css","print":"styles/print.css"}},"file":{"path":"9-develop-sym-debugger/2-核心调试逻辑/16-tinydbg_connect.md","mtime":"2025-06-15T18:01:06.921Z","type":"markdown"},"gitbook":{"version":"3.2.3","time":"2025-06-15T18:01:33.391Z"},"basePath":"../..","book":{"language":""}});
         });
     </script>
 </div>
